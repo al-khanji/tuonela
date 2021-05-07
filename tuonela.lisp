@@ -63,8 +63,8 @@
 (defun integer->leb128 (i)
   (declare (type integer i))
   (loop for pos from 0 by 7 below (leb128-length i)
-	for chunk = (ldb (byte 7 pos) i)
-	for octet = chunk then (logior chunk (ash 1 7))
+	for septet = (ldb (byte 7 pos) i)
+	for octet = septet then (logior septet (ash 1 7))
 	collect octet))
 
 (declaim (inline unsigned->signed))
@@ -85,13 +85,13 @@
 	 (decoded (leb128->integer encoded :signed signed)))
     (values n encoded decoded)))
 
-(defgeneric read-wasm-type (stream type))
+(defgeneric read-wasm-type (slurper type))
 
 (macrolet
     ((make-integer-reader (type signed size)
-       `(defmethod read-wasm-type (stream (type (eql ',type)))
+       `(defmethod read-wasm-type (slurper (type (eql ',type)))
 	  (let ((chunks (loop repeat ,(ceiling size 7)
-			      for chunk = (read-byte stream)
+			      for chunk = (read-wasm-type slurper 'byte)
 			      collect chunk
 			      until (< chunk ,(ash 1 7)))))
 	    (leb128->integer chunks :signed ,signed))))
@@ -103,8 +103,8 @@
 			       collect `(make-integer-reader ,type ,signed ,size))))))
   (frobber))
 
-(defmethod read-wasm-type (stream (type (eql 'valtype)))
-  (let ((b (read-wasm-type stream 'byte)))
+(defmethod read-wasm-type (slurper (type (eql 'valtype)))
+  (let ((b (read-wasm-type slurper 'byte)))
     (ecase b
       (#x7F 'i32)
       (#x7E 'i64)
@@ -113,32 +113,32 @@
       (#x70 'funcref)
       (#x6F 'externref))))
 
-(defmethod read-wasm-type (stream (type (eql 'functype)))
-  (let ((magic (read-byte stream)))
+(defmethod read-wasm-type (slurper (type (eql 'functype)))
+  (let ((magic (read-wasm-type slurper 'byte)))
     (assert (= magic #x60))
-    (let* ((rt1 (read-wasm-vector stream 'valtype))
-	   (rt2 (read-wasm-vector stream 'valtype)))
+    (let* ((rt1 (read-wasm-vector slurper 'valtype))
+	   (rt2 (read-wasm-vector slurper 'valtype)))
       (list rt1 rt2))))
 
-(defun read-wasm-vector (stream type &key (element-type t))
-  (let* ((length (read-wasm-type stream 'u32))
+(defun read-wasm-vector (slurper type &key (element-type t))
+  (let* ((length (read-wasm-type slurper 'u32))
 	 (vector (make-array length :element-type element-type)))
     (dotimes (i length vector)
-      (setf (aref vector i) (read-wasm-type stream type)))))
+      (setf (aref vector i) (read-wasm-type slurper type)))))
 
-(defmethod read-wasm-type (stream (type (eql 'name)))
-  (let ((bytes (read-wasm-vector stream 'byte
+(defmethod read-wasm-type (slurper (type (eql 'name)))
+  (let ((bytes (read-wasm-vector slurper 'byte
 				 :element-type '(unsigned-byte 8))))
     (or
      #+sbcl (sb-ext:octets-to-string bytes :external-format :utf-8)
      #-sbcl (map 'string #'code-char bytes))))
 
-(defmethod read-wasm-type (stream (type (eql 'byte)))
-  (read-byte stream))
+(defmethod read-wasm-type (slurper (type (eql 'byte)))
+  (slurper-read-byte slurper))
 
-(defmethod read-wasm-type (stream (type (eql 'importdesc)))
-  (let ((type (read-wasm-type stream 'byte))
-	(desc (read-wasm-type stream 'u32)))
+(defmethod read-wasm-type (slurper (type (eql 'importdesc)))
+  (let ((type (read-wasm-type slurper 'byte))
+	(desc (read-wasm-type slurper 'u32)))
     (list (ecase type
 	    (#x00 'typeidx)
 	    (#x01 'tabletype)
@@ -146,17 +146,17 @@
 	    (#x03 'globaltype))
 	  desc)))
 
-(defmethod read-wasm-type (stream (type (eql 'import)))
-  (let* ((mod (read-wasm-type stream 'name))
-	 (nm (read-wasm-type stream 'name))
-	 (d (read-wasm-type stream 'importdesc)))
+(defmethod read-wasm-type (slurper (type (eql 'import)))
+  (let* ((mod (read-wasm-type slurper 'name))
+	 (nm (read-wasm-type slurper 'name))
+	 (d (read-wasm-type slurper 'importdesc)))
     `((mod . ,mod)
       (nm . ,nm)
       (d . ,d))))
 
-(defmethod read-wasm-type (stream (type (eql 'exportdesc)))
-  (let ((type (read-wasm-type stream 'byte))
-	(desc (read-wasm-type stream 'u32)))
+(defmethod read-wasm-type (slurper (type (eql 'exportdesc)))
+  (let ((type (read-wasm-type slurper 'byte))
+	(desc (read-wasm-type slurper 'u32)))
     (list (ecase type
 	    (#x00 'typeidx)
 	    (#x01 'tabletype)
@@ -164,20 +164,20 @@
 	    (#x03 'globaltype))
 	  desc)))
 
-(defmethod read-wasm-type (stream (type (eql 'export)))
-  (let* ((nm (read-wasm-type stream 'name))
-	 (d (read-wasm-type stream 'exportdesc)))
+(defmethod read-wasm-type (slurper (type (eql 'export)))
+  (let* ((nm (read-wasm-type slurper 'name))
+	 (d (read-wasm-type slurper 'exportdesc)))
     `((nm . ,nm)
       (d . ,d))))
 
-(defmethod read-wasm-type (stream (type (eql 'code)))
-  (let* ((size (read-wasm-type stream 'u32))
-	 (locals-start-pos (file-position stream))
-	 (locals (read-wasm-vector stream 'valtype))
-	 (expr-start-pos (file-position stream))
+(defmethod read-wasm-type (slurper (type (eql 'code)))
+  (let* ((size (read-wasm-type slurper 'u32))
+	 (locals-start-pos (slurper-position slurper))
+	 (locals (read-wasm-vector slurper 'valtype))
+	 (expr-start-pos (slurper-position slurper))
 	 (expr-count (- size (- expr-start-pos
 				locals-start-pos)))
-	 (expr (read-bytes stream expr-count)))
+	 (expr (slurper-read-bytes slurper expr-count)))
     (assert (= #x0b (aref expr (1- expr-count))))
     `((size . ,size)
       (locals . ,locals)
@@ -200,87 +200,131 @@
     ;; data count
     (t 'unknown-section)))
 
-(defun read-wasm-section (stream size id)
+(defun read-wasm-section (slurper size id)
   (let ((section (make-instance (section-id->section-type id)
 				'id id
 				'size size
-				'start (file-position stream))))
-    (initialize-section-from-stream section stream)
+				'start (slurper-position slurper))))
+    (initialize-section-from-slurper section slurper)
     section))
 
-(defgeneric initialize-section-from-stream (section stream))
+(defgeneric initialize-section-from-slurper (section slurper))
 
-(defmethod initialize-section-from-stream :around ((section section) stream)
+(defmethod initialize-section-from-slurper :around ((section section) slurper)
   (call-next-method)
-  (let ((current (file-position stream))
+  (let ((current (slurper-position slurper))
 	(expected (+ (start section) (size section))))
     (unless (= current expected)
       (let ((*print-base* 16)
 	    (*print-radix* t))
 	(format t "currently at ~A but expected ~A after reading ~:_~A ~%"
 		current expected section)
-	(file-position stream expected)))))
+	(slurper-position expected)))))
 
-(defmethod initialize-section-from-stream ((section unknown-section) stream)
-  (setf (bytes section) (read-bytes stream (size section))))
+(defmethod initialize-section-from-slurper ((section unknown-section) slurper)
+  (setf (bytes section) (slurper-read-bytes slurper (size section))))
 
-(defmethod initialize-section-from-stream ((section custom-section) stream)
-  (let* ((name (read-wasm-type stream 'name))
-	 (bytes-start (file-position stream))
-	 (bytes (read-bytes stream (- (size section)
-				      (- bytes-start
-					 (start section))))))
+(defmethod initialize-section-from-slurper ((section custom-section) slurper)
+  (let* ((name (read-wasm-type slurper 'name))
+	 (bytes-start (slurper-position slurper))
+	 (bytes (slurper-read-bytes slurper (- (size section)
+					       (- bytes-start
+						  (start section))))))
     (setf (name section) name
 	  (bytes section) bytes)))
 
-(defmethod initialize-section-from-stream ((section type-section) stream)
-  (setf (functypes section) (read-wasm-vector stream 'functype)))
+(defmethod initialize-section-from-slurper ((section type-section) slurper)
+  (setf (functypes section) (read-wasm-vector slurper 'functype)))
 
-(defmethod initialize-section-from-stream ((section import-section) stream)
-  (setf (imports section) (read-wasm-vector stream 'import)))
+(defmethod initialize-section-from-slurper ((section import-section) slurper)
+  (setf (imports section) (read-wasm-vector slurper 'import)))
 
-(defmethod initialize-section-from-stream ((section function-section) stream)
-  (setf (typeidxs section) (read-wasm-vector stream 'u32)))
+(defmethod initialize-section-from-slurper ((section function-section) slurper)
+  (setf (typeidxs section) (read-wasm-vector slurper 'u32)))
 
-(defmethod initialize-section-from-stream ((section export-section) stream)
-  (setf (exports section) (read-wasm-vector stream 'export)))
+(defmethod initialize-section-from-slurper ((section export-section) slurper)
+  (setf (exports section) (read-wasm-vector slurper 'export)))
 
-(defmethod initialize-section-from-stream ((section code-section) stream)
-  (setf (codes section) (read-wasm-vector stream 'code)))
+(defmethod initialize-section-from-slurper ((section code-section) slurper)
+  (setf (codes section) (read-wasm-vector slurper 'code)))
 
-(defun read-bytes (stream count)
-  (let ((array (make-array count :element-type '(unsigned-byte 8))))
-    (values array (read-sequence array stream))))
-
-(defun %make-stream-slurper (stream)
+(defun make-stream-slurper (stream)
   (lambda (cmd &rest args)
     (ecase cmd
       (position (if (null args)
-		     (file-position stream)
-		     (apply #'file-position (cons stream args))))
+		    (file-position stream)
+		    (file-position stream (car args))))
       (get-byte (read-byte stream nil nil))
-      (get-bytes (let* ((n-bytes (car args))
-			 (array (make-array n-bytes :element-type '(unsigned-byte 8))))
-		    (values array (read-sequence array stream)))))))
+      (get-bytes (let ((array (car args)))
+		   (values array (read-sequence array stream)))))))
 
-(defun %read-wasm-module (slurper)
-  (let* ((magic (slurper 'get-bytes 4))
-	 (version (slurper 'get-bytes 4))
-	 (sections (loop for id = (slurper 'get-byte)
+(defun make-sequence-slurper (sequence)
+  (let ((position 0)
+	(sequence (coerce sequence 'vector))
+	(seqlen (length sequence)))
+    (lambda (cmd &rest args)
+      (ecase cmd
+	(position (if (null args)
+		      position
+		      (setf position (car args))))
+	(get-byte (if (< position seqlen)
+		      (prog1 (elt sequence position)
+			(incf position))))
+	(get-bytes (let* ((array (car args))
+			  (n-available (- seqlen position))
+			  (n-requested (length array))
+			  (n-resulting (min n-available n-requested)))
+		     (replace array sequence :start2 position)
+		     (incf position n-resulting)
+		     (values array n-resulting)))))))
+
+(defun slurper-read-bytes (slurper count &optional (eof-error-p t) (eof-value nil))
+  (let ((array (make-array count :element-type '(unsigned-byte 8))))
+    (multiple-value-bind (result n-bytes) (funcall slurper 'get-bytes array)
+      (if (= n-bytes count)
+	  result
+	  (if eof-error-p
+	      (error 'end-of-file)
+	      eof-value)))))
+
+(defun slurper-read-byte (slurper &optional (eof-error-p t) (eof-value nil))
+  (let ((result (funcall slurper 'get-byte)))
+    (if result
+	result
+	(if eof-error-p
+	    (error 'end-of-file)
+	    eof-value))))
+
+(defun slurper-position (slurper &optional (pos 0 pos-supplied-p))
+  ;; work around bad CL API - #'file-position behavior is specified
+  ;; in terms of two different functions depending on number of
+  ;; supplied arguments... we just mirror that here. see SBCL implementation
+  ;; of #'file-position
+  (if pos-supplied-p
+      (funcall slurper 'position pos)
+      (funcall slurper 'position)))
+
+(defun read-wasm-module-from-slurper (slurper)
+  (let* ((magic (slurper-read-bytes slurper 4))
+	 (version (slurper-read-bytes slurper 4))
+	 (sections (loop for id = (slurper-read-byte slurper nil nil)
 			 while id
-			 for size = (%read-wasm-type slurper 'u32)
-			 collect (%read-wasm-section slurper size id))))
+			 for size = (read-wasm-type slurper 'u32)
+			 collect (read-wasm-section slurper size id))))
     (make-instance 'module
 		   'magic magic
 		   'version version
 		   'sections sections)))
 
-(defun read-wasm-module (stream)
-  (%read-wasm-module (%make-stream-slurper stream)))
+(defun read-wasm-module-from-sequence (seq)
+  (read-wasm-module-from-slurper (make-sequence-slurper seq)))
 
-(defun slurp-wasm-module (filename)
+(defun read-wasm-module-from-stream (stream)
+  (read-wasm-module-from-slurper (make-stream-slurper stream)))
+
+(defun read-wasm-module-from-file (filename)
   (with-open-file (s filename :element-type '(unsigned-byte 8))
-    (read-wasm-module s)))
+    (read-wasm-module-from-stream s)))
 
 (defvar *wast-package* (make-package 'tuonela-wast :use nil))
 
@@ -294,6 +338,8 @@
 	     do (push x name)
 	  else
 	    return (setf exprs xs))
+    (when bindata
+      (setf bindata (read-wasm-module-from-sequence bindata)))
     (push (or bindata exprs)
 	  name)
     (nreverse name)))
