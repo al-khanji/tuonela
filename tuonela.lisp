@@ -69,13 +69,12 @@
   (cl:read-sequence sequence stream :start start :end end))
 
 (defmethod read-sequence (sequence (stream sequence-stream-wrapper) &key (start 0) (end nil))
-  (when (null end) (setf end (length sequence)))
-  (loop while (< start end)
-	for elem = (read-byte stream nil nil)
-	while elem
-	do (setf (elt sequence start) elem)
-	do (incf start)
-	finally (return start)))
+  (let ((end (or end (length sequence))))
+    (loop for index from start below end
+	  for elem = (read-byte stream nil nil)
+	  while elem
+	  do (setf (elt sequence index) elem)
+	  finally (return index))))
 
 (defgeneric file-position (stream &optional position-spec))
 
@@ -87,10 +86,9 @@
 (defmethod file-position ((stream sequence-stream-wrapper) &optional (position 0 position-supplied-p))
   (with-slots (pos length) stream
     (if position-supplied-p
-	(if (< position length)
-	    (progn (setf pos position)
-		   t)
-	    nil)
+	(let ((position-ok (< position length)))
+	  (when position-ok (setf pos position))
+	  position-ok)
 	pos)))
 
 (defun read-bytes (count in &optional (seq (make-array count :element-type '(unsigned-byte 8))))
@@ -99,36 +97,206 @@
 
 ;; Embedding
 
-(defstruct (store (:constructor store-init))
-  funcs tables mems globals elems datas)
+(defmacro %defclass (name direct-superclasses direct-slots &rest options)
+  (labels ((mk-list (x)
+	     (if (listp x) x (list x)))
+	   (as-keyword (sym)
+	     (intern (string sym) :keyword))
+	   (slot->defclass-slot (spec)
+	     (let* ((spec (mk-list spec))
+		    (name (first spec))
+		    (options (rest spec))
+		    (initform (getf options :initform))
+		    (initarg (or (getf options :initarg)
+				 (as-keyword name))))
+	       `(,name :initarg ,initarg :initform ,initform))))
+    (let* ((direct-slots (mapcar #'slot->defclass-slot direct-slots))
+	   (slot-names (mapcar #'first direct-slots))
+	   (format-string (format nil
+				  "~~@<~{~W ~~W~^ ~~:_~}~~:>"
+				  (mapcar #'as-keyword slot-names))))
+      `(progn
+	 (defclass ,name ,direct-superclasses
+	   ,direct-slots
+	   ,@options)
+	 (defmethod print-object ((object ,name) stream)
+	   (print-unreadable-object (object stream :type t)
+	     (with-slots ,slot-names object
+	       (let ((*print-base* 16)
+		     (*print-radix* t))
+		 (format stream ,format-string ,@slot-names)))))))))
 
-(defstruct moduleinst
-  types funcaddrs tableaddrs memaddrs globaladdrs elemaddrs dataaddrs exports)
+(%defclass store ()
+  (funcs
+   tables
+   mems
+   globals
+   elems
+   datas))
 
-(defstruct module
-  types funcs tables mems globals elems datas start imports exports custom)
+(%defclass moduleinst ()
+  (types
+   funcaddrs
+   tableaddrs
+   memaddrs
+   globaladdrs
+   elemaddrs
+   dataaddrs
+   exports))
 
-(defstruct functype
-  parameters results)
+(%defclass exportinst ()
+  (name value))
 
-(defstruct func
-  type locals body)
+(%defclass module ()
+  (types
+   funcs
+   tables
+   mems
+   globals
+   elems
+   datas
+   start
+   imports
+   exports
+   custom))
 
-(defstruct import
-  module name desc)
+(%defclass functype ()
+  (parameters
+   results))
 
-(defstruct export
-  name desc)
+(%defclass memtype ()
+  (limits))
+
+(%defclass tabletype ()
+  (limits
+   reftype))
+
+(%defclass globaltype ()
+  (mut
+   valtype))
+
+(%defclass func ()
+  (type
+   locals
+   body))
+
+(%defclass import ()
+  (module
+   name
+   desc))
+
+(%defclass export ()
+  (name
+   desc))
+
+(define-condition api-error (error)
+  ((message :initarg :message
+	    :reader api-error-message))
+  (:report (lambda (condition stream)
+	     (format stream "tuonela api error: ~A."
+		     (api-error-message condition)))))
+
+(defun store-init ()
+  (make-instance 'store))
 
 (defun module-decode (bytes)
-  (with-input-from-sequence (in bytes)
-    (read-binary-module in)))
+  (handler-bind ((bad-binary-module
+		   #'(lambda (c)
+		       (let ((msg (format nil "module-decode failed: ~A" c)))
+			 (error 'api-error :message msg))))
+		 (end-of-file
+		   #'(lambda (c)
+		       (declare (ignore c))
+		       (let ((msg "module-decode failed due to unexpected end of file"))
+			 (error 'api-error :message msg)))))
+    (with-input-from-sequence (in bytes)
+      (read-binary-module in))))
 
 (defun module-validate (module)
   t)
 
 (defun module-instantiate (store module externvals)
-  )
+  (let ((moduleinst (make-instance 'moduleinst)))
+    (loop for (type addr) in externvals
+	  do (let ((target (ecase type
+			     (func 'funcaddrs)
+			     (table 'tableaddrs)
+			     (mem 'memaddrs)
+			     (global 'globaladdrs))))
+	       (setf (slot-value moduleinst target)
+		     (concatenate 'vector
+				  (slot-value moduleinst target)
+				  (list addr)))))
+    (values store moduleinst)))
+
+(defun module-imports (module)
+  (with-slots (imports types) module
+    (loop for import across imports
+	  collect (with-slots (module name desc) import
+		    (let* ((type (first desc))
+			   (target (second desc))
+			   (externtype (ecase type
+					 (func (elt types target))
+					 (t target))))
+		      (list module name externtype))))))
+
+(defun module-exports (module)
+  (with-slots (exports types) module
+    (loop for export across exports
+	  collect (with-slots (name desc) export
+		    (let* ((type (first desc))
+			   (target (second desc))
+			   (externtype (ecase type
+					 (func (elt types target)))))
+		      (list name externtype))))))
+
+(defun instance-export (moduleinst name)
+  (loop for exportinst across (or (slot-value moduleinst 'exports) #())
+	for export-name = (slot-value exportinst 'name)
+	if (string= export-name name)
+	  return exportinst
+	finally (error 'api-error
+		       :message (format nil "instance-export: no export named ~A in ~A" name moduleinst))))
+
+;; Instructions
+
+(defgeneric instruction->opcode (instruction))
+(defgeneric opcode->instruction (opcode))
+(defgeneric compile-instruction (instruction stream))
+
+(defmacro define-instruction (instruction opcode parameters &key type validation execution)
+  `(progn
+     (defmethod instruction->opcode ((instruction (eql ',instruction)))
+       ,opcode)
+     (defmethod opcode->instruction ((opcode (eql ,opcode)))
+       ',instruction)
+     (defmethod compile-instruction ((instruction (eql ',instruction)) stream)
+       (let ((bindings (loop for (name type) in ',parameters
+			     collect (list name (read-binary-value type stream))))
+	     (code ',execution))
+	 (when (and bindings code)
+	   (push bindings code)
+	   (push 'let code))
+	 code))))
+
+(define-instruction end #x0B ())
+
+(define-instruction call #x10 ((x u32))
+  :type (func-type (funcs x))
+  :execution ((let ((a (funcaddr x)))
+		(invoke a))))
+
+(define-instruction i32.const #x41 ((c i32))
+  :type '(() -> (i32))
+  :execution ((push c)))
+
+(defun compile-function (func)
+  (with-input-from-sequence (in (slot-value func 'body))
+    (loop for opcode = (read-byte in nil nil)
+	  while opcode
+	  for instruction = (opcode->instruction opcode)
+	  for code = (compile-instruction instruction in)
+	  if code collect code)))
 
 ;; Binary Format
 (define-condition bad-binary-module (error)
@@ -204,31 +372,38 @@
 
 (defmethod read-binary-value ((type (eql 'functype)) in)
   (check-magic in #x60)
-  (make-functype :parameters (read-binary-vector 'valtype in)
+  (make-instance 'functype
+		 :parameters (read-binary-vector 'valtype in)
 		 :results (read-binary-vector 'valtype in)))
 
 (defmethod read-binary-value ((type (eql 'import)) in)
-  (make-import :module (read-binary-value 'name in)
-	       :name (read-binary-value 'name in)
-	       :desc (read-binary-value 'importdesc in)))
+  (make-instance 'import
+		 :module (read-binary-value 'name in)
+		 :name (read-binary-value 'name in)
+		 :desc (read-binary-value 'importdesc in)))
 
 (defmethod read-binary-value ((type (eql 'export)) in)
-  (make-export :name (read-binary-value 'name in)
-	       :desc (read-binary-value 'exportdesc in)))
+  (make-instance 'export
+		 :name (read-binary-value 'name in)
+		 :desc (read-binary-value 'exportdesc in)))
 
 (defmethod read-binary-value ((type (eql 'importdesc)) in)
-  (case (read-binary-value 'byte in)
-    (#x00 (list 'func (read-binary-value 'typeidx in)))
-    (#x01 (list 'table (read-binary-value 'tabletype in)))
-    (#x02 (list 'mem (read-binary-value 'memtype in)))
-    (#x03 (list 'global (read-binary-value 'globaltype in)))))
+  (destructuring-bind (id type)
+      (case (read-binary-value 'byte in)
+	(#x00 '(func typeidx))
+	(#x01 '(table tabletype))
+	(#x02 '(mem memtype))
+	(#x03 '(global globaltype)))
+    (list id (read-binary-value type in))))
 
 (defmethod read-binary-value ((type (eql 'exportdesc)) in)
-  (case (read-binary-value 'byte in)
-    (#x00 (list 'func (read-binary-value 'funcidx in)))
-    (#x01 (list 'table (read-binary-value 'tableidx in)))
-    (#x02 (list 'mem (read-binary-value 'memidx in)))
-    (#x03 (list 'global (read-binary-value 'globalidx in)))))
+  (destructuring-bind (id type)
+      (case (read-binary-value 'byte in)
+	(#x00 '(func funcidx))
+	(#x01 '(table tableidx))
+	(#x02 '(mem memidx))
+	(#x03 '(global globalidx)))
+    (list id (read-binary-value type in))))
 
 (defmethod read-binary-value ((type (eql 'code)) in)
   (let* ((size (read-binary-value 'u32 in))
@@ -262,23 +437,27 @@
 (make-byte-mapper reftype *reftypes*)
 (make-byte-mapper valtype *valtypes*)
 
-(defun read-binary-vector (type in &key (element-type t) (constructor #'identity))
+(defun read-binary-vector (type in &key vector (element-type t) (constructor #'identity))
   (let* ((count (read-binary-value 'u32 in))
-	 (vector (make-array count :element-type element-type)))
+	 (vector (or vector
+		     (make-array count :element-type element-type))))
     (dotimes (i count)
       (setf (aref vector i)
 	    (funcall constructor (read-binary-value type in))))
-    vector))
+    (values vector count)))
 
-(defparameter *binary-sections* nil)
-
+(defgeneric section-id->section-name (id))
+(defgeneric section-name->section-id (name))
 (defgeneric read-binary-section (id size module in))
 
 (defmacro define-binary-section (id name &body spec)
   (with-gensyms (idvar)
     `(progn
-       (eval-when (:load-toplevel)
-	 (push (cons ,id ',name) *binary-sections*))
+       (defmethod section-id->section-name ((id (eql ,id)))
+	 ',name)
+       
+       (defmethod section-name->section-id ((name (eql ',name)))
+	 ,id)
        
        ,(destructuring-bind ((size module in) &body body) (rest (assoc :reader spec)) 
           `(defmethod read-binary-section ((,idvar (eql ,id)) ,size ,module ,in)
@@ -311,7 +490,7 @@
    (size module in)
    (setf (slot-value module 'funcs)
 	 (read-binary-vector 'typeidx in
-			     :constructor (lambda (type) (make-func :type type))))))
+			     :constructor (lambda (type) (make-instance 'func :type type))))))
 
 (define-binary-section 7 exportsec
   (:reader
@@ -323,14 +502,14 @@
   (:reader
    (size module in)
    (let ((code-count (read-binary-value 'u32 in))
-	 (module-funcs (module-funcs module)))
+	 (module-funcs (slot-value module 'funcs)))
      (when (/= code-count (length module-funcs))
        (error 'bad-binary-module))
      (loop repeat code-count
 	   for func across module-funcs
 	   do (destructuring-bind (locals exprs) (read-binary-value 'code in)
-		(setf (func-locals func) locals
-		      (func-body func) exprs))))))
+		(setf (slot-value func 'locals) locals
+		      (slot-value func 'body) exprs))))))
 
 (defparameter *binary-section-order*
   '(typesec
